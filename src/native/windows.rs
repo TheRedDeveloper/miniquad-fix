@@ -44,17 +44,14 @@ const WM_KILLFOCUS: UINT = 0x0008;
 
 /// Global flag tracking whether IME has been explicitly disabled by the user.
 /// This is controlled via `show_keyboard(bool)` API calls.
-use std::sync::atomic::{AtomicBool, AtomicPtr};
+use std::sync::atomic::AtomicBool;
 static IME_USER_DISABLED: AtomicBool = AtomicBool::new(false);
-
-/// The main window HWND, stored as a raw pointer for cross-crate access.
-static WINDOW_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Get the main window HWND as a raw pointer.
 ///
 /// Returns `null_mut()` if the window has not been created yet.
-pub fn get_window_hwnd() -> *mut std::ffi::c_void {
-    WINDOW_HWND.load(std::sync::atomic::Ordering::Acquire)
+pub(crate) fn get_window_hwnd() -> *mut std::ffi::c_void {
+    crate::native_display().lock().unwrap().hwnd
 }
 
 // IME composition form constants
@@ -974,9 +971,6 @@ unsafe fn create_window(
     );
     assert!(!hwnd.is_null());
 
-    // Store the HWND globally so external code can access it
-    WINDOW_HWND.store(hwnd as *mut std::ffi::c_void, std::sync::atomic::Ordering::Release);
-
     // NOTE: Do not call ShowWindow here!
     // Must show window AFTER SetPixelFormat and wglCreateContext
     // Otherwise IME will not work correctly.
@@ -1218,6 +1212,9 @@ where
             blocking_event_loop: conf.platform.blocking_event_loop,
             ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
         });
+
+        // Store the HWND in NativeDisplayData so external code can access it via window::windows_hwnd()
+        crate::native_display().lock().unwrap().hwnd = wnd as *mut std::ffi::c_void;
 
         display.update_dimensions(wnd);
 
