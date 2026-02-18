@@ -446,7 +446,7 @@ pub mod window {
     /// Only available on Windows.
     #[cfg(target_os = "windows")]
     pub fn windows_hwnd() -> *mut std::ffi::c_void {
-        crate::native::windows::get_window_hwnd()
+        crate::native_display().lock().unwrap().hwnd
     }
 }
 

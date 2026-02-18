@@ -47,13 +47,6 @@ const WM_KILLFOCUS: UINT = 0x0008;
 use std::sync::atomic::AtomicBool;
 static IME_USER_DISABLED: AtomicBool = AtomicBool::new(false);
 
-/// Get the main window HWND as a raw pointer.
-///
-/// Returns `null_mut()` if the window has not been created yet.
-pub(crate) fn get_window_hwnd() -> *mut std::ffi::c_void {
-    crate::native_display().lock().unwrap().hwnd
-}
-
 // IME composition form constants
 const CFS_POINT: DWORD = 0x0002;
 const CFS_CANDIDATEPOS: DWORD = 0x0040;
@@ -1210,11 +1203,9 @@ where
             high_dpi: conf.high_dpi,
             dpi_scale: display.window_scale,
             blocking_event_loop: conf.platform.blocking_event_loop,
+            hwnd: wnd as *mut std::ffi::c_void,
             ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
         });
-
-        // Store the HWND in NativeDisplayData so external code can access it via window::windows_hwnd()
-        crate::native_display().lock().unwrap().hwnd = wnd as *mut std::ffi::c_void;
 
         display.update_dimensions(wnd);
 
