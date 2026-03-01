@@ -1,15 +1,13 @@
 [package]
-name = "miniquad"
+name = "miniquad-ply"
 version = "0.4.8"
 authors = ["not-fl3 <not.fl3@gmail.com>"]
 edition = "2018"
 rust-version = "1.70"
 license = "MIT OR Apache-2.0"
 homepage = "https://github.com/not-fl3/miniquad"
-repository = "https://github.com/not-fl3/miniquad"
-description = """
-Cross-platform window context and rendering library.
-"""
+repository = "https://github.com/TheRedDeveloper/miniquad-fix"
+description = "Temporary fork of miniquad with fixes for ply-engine. Do not depend on this directly."
 readme = "README.md"
 exclude = ["examples/"]
 keywords = ["graphics", "3D", "opengl", "gamedev", "windowing"]
