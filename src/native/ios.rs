@@ -20,9 +20,18 @@ use {
         cell::RefCell,
         os::raw::c_void,
         sync::{mpsc, Arc, Mutex},
-        thread::{self},
     },
 };
+
+// iOS 27 / TN3187: windows must be created via `initWithWindowScene:`
+// or they stay invisible. Window creation defers to the
+// `UISceneWillConnectNotification` observer below; both that and
+// `did_finish_launching_with_options` run on the main thread, so
+// `thread_local` storage is sound.
+thread_local! {
+    static PENDING_SCENE_VIEW_AND_CTRL: RefCell<Option<(ObjcId, ObjcId)>> =
+        RefCell::new(None);
+}
 
 struct MainThreadState {
     quit: bool,
@@ -30,7 +39,6 @@ struct MainThreadState {
     update_requested: bool,
     view: *mut Object,
     keymods: KeyMods,
-    cur_msg: Message,
 }
 
 struct IosDisplay {
@@ -44,6 +52,12 @@ struct IosDisplay {
     _gles2: bool,
     f: Option<Box<dyn 'static + FnOnce() -> Box<dyn EventHandler>>>,
     state: Arc<Mutex<MainThreadState>>,
+    /// UIKit-side events; drained at the start of every `drawInMTKView:`.
+    messages_rx: mpsc::Receiver<Message>,
+    /// User-code requests (`schedule_update` etc.); same drain
+    /// cadence as `messages_rx`.
+    requests_rx: mpsc::Receiver<crate::native::Request>,
+    blocking_event_loop: bool,
 }
 
 impl IosDisplay {
@@ -76,6 +90,77 @@ fn get_window_payload(this: &Object) -> &mut IosDisplay {
     unsafe {
         let ptr: *mut c_void = *this.get_ivar("display_ptr");
         &mut *(ptr as *mut IosDisplay)
+    }
+}
+
+/// Apply a `Message` to the payload's event handler + state. Called
+/// inline at the start of each `drawInMTKView:` for every pending
+/// message.
+fn dispatch_message(payload: &mut IosDisplay, msg: Message) {
+    match msg {
+        Message::Pause => {
+            payload.state.lock().unwrap().paused = true;
+        }
+        Message::Resume => {
+            payload.state.lock().unwrap().paused = false;
+        }
+        Message::Destroy => {
+            payload.state.lock().unwrap().quit = true;
+        }
+        Message::Touch {
+            phase,
+            touch_id,
+            x,
+            y,
+        } => {
+            if let Some(ref mut event_handler) = payload.event_handler {
+                event_handler.touch_event(phase, touch_id, x, y);
+            }
+        }
+        Message::Character { character } => {
+            if let Some(character) = char::from_u32(character) {
+                if let Some(ref mut event_handler) = payload.event_handler {
+                    event_handler.char_event(character, Default::default(), false);
+                }
+            }
+        }
+        Message::KeyDown { keycode } => {
+            let keymods = {
+                let mut state = payload.state.lock().unwrap();
+                match keycode {
+                    KeyCode::LeftShift | KeyCode::RightShift => state.keymods.shift = true,
+                    KeyCode::LeftControl | KeyCode::RightControl => state.keymods.ctrl = true,
+                    KeyCode::LeftAlt | KeyCode::RightAlt => state.keymods.alt = true,
+                    KeyCode::LeftSuper | KeyCode::RightSuper => state.keymods.logo = true,
+                    _ => {}
+                }
+                state.keymods
+            };
+            if let Some(ref mut event_handler) = payload.event_handler {
+                event_handler.key_down_event(keycode, keymods, false);
+            }
+        }
+        Message::KeyUp { keycode } => {
+            let keymods = {
+                let mut state = payload.state.lock().unwrap();
+                match keycode {
+                    KeyCode::LeftShift | KeyCode::RightShift => state.keymods.shift = false,
+                    KeyCode::LeftControl | KeyCode::RightControl => state.keymods.ctrl = false,
+                    KeyCode::LeftAlt | KeyCode::RightAlt => state.keymods.alt = false,
+                    KeyCode::LeftSuper | KeyCode::RightSuper => state.keymods.logo = false,
+                    _ => {}
+                }
+                state.keymods
+            };
+            if let Some(ref mut event_handler) = payload.event_handler {
+                event_handler.key_up_event(keycode, keymods);
+            }
+        }
+        Message::Resize { width, height } => {
+            if let Some(ref mut event_handler) = payload.event_handler {
+                event_handler.resize_event(width as _, height as _);
+            }
+        }
     }
 }
 
@@ -188,79 +273,6 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
         on_touch(this, event, TouchPhase::Cancelled);
     }
 
-    extern "C" fn process_message(this: &Object, _: Sel, _: ObjcId) {
-        let payload = get_window_payload(this);
-        if payload.event_handler.is_none() {
-            payload.init_event_handler();
-        }
-        let msg = {
-            let state = payload.state.lock().unwrap();
-            state.cur_msg
-        };
-        match msg {
-            Message::Pause => {
-                let mut state = payload.state.lock().unwrap();
-                state.paused = true;
-            }
-            Message::Resume => {
-                let mut state = payload.state.lock().unwrap();
-                state.paused = false;
-            }
-            Message::Destroy => {
-                let mut state = payload.state.lock().unwrap();
-                state.quit = true;
-            }
-            Message::Touch {
-                phase,
-                touch_id,
-                x,
-                y,
-            } => {
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.touch_event(phase, touch_id, x, y);
-                }
-            }
-            Message::Character { character } => {
-                if let Some(character) = char::from_u32(character) {
-                    if let Some(ref mut event_handler) = payload.event_handler {
-                        event_handler.char_event(character, Default::default(), false);
-                    }
-                }
-            }
-            Message::KeyDown { keycode } => {
-                let mut state = payload.state.lock().unwrap();
-                match keycode {
-                    KeyCode::LeftShift | KeyCode::RightShift => state.keymods.shift = true,
-                    KeyCode::LeftControl | KeyCode::RightControl => state.keymods.ctrl = true,
-                    KeyCode::LeftAlt | KeyCode::RightAlt => state.keymods.alt = true,
-                    KeyCode::LeftSuper | KeyCode::RightSuper => state.keymods.logo = true,
-                    _ => {}
-                }
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.key_down_event(keycode, state.keymods, false);
-                }
-            }
-            Message::KeyUp { keycode } => {
-                let mut state = payload.state.lock().unwrap();
-                match keycode {
-                    KeyCode::LeftShift | KeyCode::RightShift => state.keymods.shift = false,
-                    KeyCode::LeftControl | KeyCode::RightControl => state.keymods.ctrl = false,
-                    KeyCode::LeftAlt | KeyCode::RightAlt => state.keymods.alt = false,
-                    KeyCode::LeftSuper | KeyCode::RightSuper => state.keymods.logo = false,
-                    _ => {}
-                }
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.key_up_event(keycode, state.keymods);
-                }
-            }
-            Message::Resize { width, height } => {
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.resize_event(width as _, height as _);
-                }
-            }
-        }
-    }
-
     unsafe {
         decl.add_method(sel!(isOpaque), yes as extern "C" fn(&Object, Sel) -> BOOL);
         decl.add_method(
@@ -278,10 +290,6 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
         decl.add_method(
             sel!(touchesCanceled: withEvent:),
             touches_canceled as extern "C" fn(&Object, Sel, ObjcId, ObjcId),
-        );
-        decl.add_method(
-            sel!(processMessage:),
-            process_message as extern "C" fn(&Object, Sel, ObjcId),
         );
     }
 
@@ -326,32 +334,46 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
             payload.init_event_handler();
         }
 
-        let main_screen: ObjcId = unsafe { msg_send![class!(UIScreen), mainScreen] };
-        let screen_rect: NSRect = unsafe { msg_send![main_screen, bounds] };
-        let high_dpi = native_display().lock().unwrap().high_dpi;
+        // Drain requests + UIKit-side messages and dispatch inline
+        // before drawing this frame.
+        while let Ok(request) = payload.requests_rx.try_recv() {
+            payload.state.lock().unwrap().process_request(request);
+        }
+        while let Ok(msg) = payload.messages_rx.try_recv() {
+            dispatch_message(payload, msg);
+        }
 
-        let (screen_width, screen_height) = if high_dpi {
-            let scale: f64 = unsafe { msg_send![main_screen, scale] };
+        // Skip the draw if paused or, in `blocking_event_loop` mode,
+        // if no update is pending. `CADisplayLink` keeps ticking
+        // cheaply.
+        if payload.state.lock().unwrap().paused {
+            return;
+        }
+        if payload.blocking_event_loop && !payload.state.lock().unwrap().update_requested {
+            return;
+        }
 
-            (
-                (screen_rect.size.width * scale) as i32,
-                (screen_rect.size.height * scale) as i32,
-            )
-        } else {
-            let content_scale_factor: f64 = unsafe { msg_send![payload.view, contentScaleFactor] };
-            (
-                (screen_rect.size.width * content_scale_factor) as i32,
-                (screen_rect.size.height * content_scale_factor) as i32,
-            )
+        // Measure the view, not the device screen — iOS-on-Mac
+        // windowed mode has view < UIScreen.
+        let view_bounds: NSRect = unsafe { msg_send![payload.view, bounds] };
+        let content_scale_factor: f64 =
+            unsafe { msg_send![payload.view, contentScaleFactor] };
+        let screen_width = (view_bounds.size.width * content_scale_factor) as i32;
+        let screen_height = (view_bounds.size.height * content_scale_factor) as i32;
+        let dpi_scale = content_scale_factor as f32;
+
+        let needs_update = {
+            let d = native_display().lock().unwrap();
+            d.screen_width != screen_width
+                || d.screen_height != screen_height
+                || d.dpi_scale != dpi_scale
         };
-
-        if native_display().lock().unwrap().screen_width != screen_width
-            || native_display().lock().unwrap().screen_height != screen_height
-        {
+        if needs_update {
             {
                 let mut d = native_display().lock().unwrap();
                 d.screen_width = screen_width;
                 d.screen_height = screen_height;
+                d.dpi_scale = dpi_scale;
             }
             send_message(Message::Resize {
                 width: screen_width,
@@ -371,6 +393,31 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
         draw_in_rect(this, s, o, nil);
     }
 
+    // `MTKViewDelegate` requires this alongside `drawInMTKView:`;
+    // missing it crashes `_resizeDrawable` with
+    // `NSInvalidArgumentException`. Sync `native_display` here so
+    // the next frame's `setScissorRect` (and anything else reading
+    // `screen_size`) matches the new drawable — `draw_in_rect`'s
+    // `UIScreen.bounds` poll is the fallback but lags drawableSize
+    // during rotation animations.
+    extern "C" fn drawable_size_will_change(_: &Object, _: Sel, _: ObjcId, size: NSSize) {
+        let width = size.width as i32;
+        let height = size.height as i32;
+        let changed = {
+            let mut display = native_display().lock().unwrap();
+            let changed =
+                display.screen_width != width || display.screen_height != height;
+            if changed {
+                display.screen_width = width;
+                display.screen_height = height;
+            }
+            changed
+        };
+        if changed {
+            send_message(Message::Resize { width, height });
+        }
+    }
+
     unsafe {
         decl.add_method(
             sel!(glkView: drawInRect:),
@@ -380,6 +427,11 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
         decl.add_method(
             sel!(drawInMTKView:),
             draw_in_rect2 as extern "C" fn(&Object, Sel, ObjcId),
+        );
+
+        decl.add_method(
+            sel!(mtkView: drawableSizeWillChange:),
+            drawable_size_will_change as extern "C" fn(&Object, Sel, ObjcId, NSSize),
         );
     }
 
@@ -463,8 +515,10 @@ unsafe fn create_metal_view(screen_rect: NSRect, _sample_count: i32, _high_dpi: 
 
     msg_send_![view_ctrl_obj, setView: mtk_view_obj];
 
-    msg_send_![mtk_view_obj, setEnableSetNeedsDisplay: YES];
-    msg_send_![mtk_view_obj, setPaused: YES];
+    // Continuous draw — `CADisplayLink` drives `drawInMTKView:` on
+    // the main thread at `preferredFramesPerSecond`.
+    msg_send_![mtk_view_obj, setEnableSetNeedsDisplay: NO];
+    msg_send_![mtk_view_obj, setPaused: NO];
     msg_send_![mtk_view_obj, setPreferredFramesPerSecond:60];
     msg_send_![mtk_view_obj, setDelegate: mtk_view_dlg_obj];
     let device = MTLCreateSystemDefaultDevice();
@@ -493,13 +547,17 @@ pub fn define_app_delegate() -> *const Class {
     let mut decl = ClassDecl::new("NSAppDelegate", superclass).unwrap();
 
     extern "C" fn did_finish_launching_with_options(
-        _: &Object,
+        delegate_self: &Object,
         _: Sel,
         _: ObjcId,
         _: ObjcId,
     ) -> BOOL {
         unsafe {
-            let (f, conf) = RUN_ARGS.take().unwrap();
+            // Routed through a raw pointer to satisfy the Rust 2024
+            // `static_mut_refs` lint. Split across two statements so
+            // clippy's `deref_addrof` doesn't fold it back.
+            let run_args_ptr = &raw mut RUN_ARGS;
+            let (f, conf) = (*run_args_ptr).take().unwrap();
 
             let main_screen: ObjcId = msg_send![class!(UIScreen), mainScreen];
             let screen_rect: NSRect = msg_send![main_screen, bounds];
@@ -518,9 +576,8 @@ pub fn define_app_delegate() -> *const Class {
                 )
             };
 
-            let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
-            let window_obj: ObjcId = msg_send![window_obj, initWithFrame: screen_rect];
-
+            // Window creation defers to `scene_will_connect`; view +
+            // view_ctrl built now so the render thread has them ready.
             let view = match conf.platform.apple_gfx_api {
                 AppleGfxApi::OpenGl => {
                     create_opengl_view(screen_rect, conf.sample_count, conf.high_dpi)
@@ -582,7 +639,6 @@ pub fn define_app_delegate() -> *const Class {
                     alt: false,
                     logo: false,
                 },
-                cur_msg: Message::Resume,
             }));
 
             let payload = Box::new(IosDisplay {
@@ -596,6 +652,9 @@ pub fn define_app_delegate() -> *const Class {
                 event_handler: None,
                 _gles2: view._gles2,
                 state: state_original.clone(),
+                messages_rx: rx,
+                requests_rx,
+                blocking_event_loop: conf.platform.blocking_event_loop,
             });
             let payload_ptr = Box::into_raw(payload) as *mut std::ffi::c_void;
 
@@ -603,85 +662,37 @@ pub fn define_app_delegate() -> *const Class {
             (*view.view_dlg).set_ivar("display_ptr", payload_ptr);
             (*textfield_dlg).set_ivar("display_ptr", payload_ptr);
 
-            msg_send_![window_obj, addSubview: view.view];
+            // Stash view + view_ctrl for `scene_will_connect` to adopt
+            // into a freshly-created `initWithWindowScene:` window.
+            PENDING_SCENE_VIEW_AND_CTRL
+                .with(|cell| *cell.borrow_mut() = Some((view.view, view.view_ctrl)));
 
-            msg_send_![window_obj, setRootViewController: view.view_ctrl];
+            let notification_center: ObjcId =
+                msg_send![class!(NSNotificationCenter), defaultCenter];
+            let scene_will_connect_name =
+                apple_util::str_to_nsstring("UISceneWillConnectNotification");
+            let _: () = msg_send![notification_center,
+                addObserver: delegate_self
+                selector: sel!(sceneWillConnect:)
+                name: scene_will_connect_name
+                object: nil];
 
-            msg_send_![window_obj, makeKeyAndVisible];
+            // iOS 27 fires `applicationWillResignActive:` during the
+            // scene-attach handoff (legacy lifecycle compat path), which
+            // sends `Message::Pause` and blocks the render thread. There's
+            // no follow-up `applicationDidBecomeActive:` because the scene
+            // lifecycle drives the real activation. Re-Resume on every
+            // scene activation to recover.
+            let scene_did_activate_name =
+                apple_util::str_to_nsstring("UISceneDidActivateNotification");
+            let _: () = msg_send![notification_center,
+                addObserver: delegate_self
+                selector: sel!(sceneDidActivate:)
+                name: scene_did_activate_name
+                object: nil];
 
-            struct SendHack<F>(F);
-            unsafe impl<F> Send for SendHack<F> {}
-
-            let state = SendHack(state_original.clone());
-            thread::spawn(move || {
-                let s = state.0;
-
-                loop {
-                    while let Ok(request) = requests_rx.try_recv() {
-                        s.lock().unwrap().process_request(request);
-                    }
-
-                    let block_on_wait = {
-                        let s = s.lock().unwrap();
-                        (conf.platform.blocking_event_loop && !s.update_requested) || s.paused
-                    };
-
-                    if block_on_wait {
-                        let res = rx.recv();
-
-                        if let Ok(msg) = res {
-                            let view;
-                            {
-                                let mut s = s.lock().unwrap();
-                                view = s.view;
-                                s.cur_msg = msg;
-                            }
-                            msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
-                        }
-                    } else {
-                        // process all the messages from the main thread
-                        while let Ok(msg) = rx.try_recv() {
-                            let view;
-                            {
-                                let mut s = s.lock().unwrap();
-                                view = s.view;
-                                s.cur_msg = msg;
-                            }
-                            msg_send_![&*view, performSelectorOnMainThread:sel!(processMessage:) withObject:nil waitUntilDone:YES];
-                        }
-                    }
-
-                    let update_requested;
-                    let view;
-                    {
-                        let s = s.lock().unwrap();
-                        update_requested = s.update_requested;
-                        view = s.view;
-                    }
-
-                    if !conf.platform.blocking_event_loop || update_requested {
-                        match conf.platform.apple_gfx_api {
-                            AppleGfxApi::OpenGl => {
-                                // Why it differs from Metal? I don't realy know. Looks like a bug.
-                                // Somehow it needs `setNeedsDisplay` to redraw after touch.
-                                // With plain `display` it draws only after another touch.
-                                // But when it's not blocking_event_loop it makes fps really drop with `setNeedsDisplay`.
-                                // I hope it will work the same on the real device.
-                                if conf.platform.blocking_event_loop {
-                                    msg_send_![&*view, performSelectorOnMainThread:sel!(setNeedsDisplay) withObject:nil waitUntilDone:NO];
-                                } else {
-                                    msg_send_![&*view, performSelectorOnMainThread:sel!(display) withObject:nil waitUntilDone:YES];
-                                }
-                            }
-                            AppleGfxApi::Metal => {
-                                msg_send_![&*view, performSelectorOnMainThread:sel!(setNeedsDisplay) withObject:nil waitUntilDone:NO];
-                            }
-                        }
-                    }
-
-                    thread::yield_now();
-                }
-            });
+            // No background render thread — `CADisplayLink` drives
+            // `drawInMTKView:` directly.
         }
         YES
     }
@@ -692,6 +703,33 @@ pub fn define_app_delegate() -> *const Class {
 
     extern "C" fn application_will_resign_active(_: &Object, _: Sel, _: ObjcId) {
         send_message(Message::Pause);
+    }
+
+    extern "C" fn scene_will_connect(_: &Object, _: Sel, notification: ObjcId) {
+        unsafe {
+            let scene: ObjcId = msg_send![notification, object];
+            let is_window_scene: BOOL =
+                msg_send![scene, isKindOfClass: class!(UIWindowScene)];
+            if is_window_scene == NO {
+                return;
+            }
+
+            let (view, view_ctrl) =
+                match PENDING_SCENE_VIEW_AND_CTRL.with(|cell| cell.borrow_mut().take()) {
+                    Some(pair) => pair,
+                    None => return,
+                };
+
+            let window: ObjcId = msg_send![class!(UIWindow), alloc];
+            let window: ObjcId = msg_send![window, initWithWindowScene: scene];
+            msg_send_![window, addSubview: view];
+            msg_send_![window, setRootViewController: view_ctrl];
+            msg_send_![window, makeKeyAndVisible];
+        }
+    }
+
+    extern "C" fn scene_did_activate(_: &Object, _: Sel, _: ObjcId) {
+        send_message(Message::Resume);
     }
 
     unsafe {
@@ -707,6 +745,14 @@ pub fn define_app_delegate() -> *const Class {
         decl.add_method(
             sel!(applicationWillResignActive:),
             application_will_resign_active as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
+            sel!(sceneWillConnect:),
+            scene_will_connect as extern "C" fn(&Object, Sel, ObjcId),
+        );
+        decl.add_method(
+            sel!(sceneDidActivate:),
+            scene_did_activate as extern "C" fn(&Object, Sel, ObjcId),
         );
     }
     decl.register()
