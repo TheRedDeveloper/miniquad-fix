@@ -18,10 +18,17 @@ const NUM_INFLIGHT_FRAMES: usize = 3;
 // uniform-buffer offset alignment.
 #[cfg(any(
     target_os = "macos",
-    all(target_os = "ios", any(target_arch = "x86_64", target_abi = "sim")),
+    all(
+        any(target_os = "ios", target_os = "tvos"),
+        any(target_arch = "x86_64", target_abi = "sim"),
+    ),
 ))]
 const UNIFORM_BUFFER_ALIGN: u64 = 256;
-#[cfg(all(target_os = "ios", target_arch = "aarch64", not(target_abi = "sim")))]
+#[cfg(all(
+    any(target_os = "ios", target_os = "tvos"),
+    target_arch = "aarch64",
+    not(target_abi = "sim"),
+))]
 const UNIFORM_BUFFER_ALIGN: u64 = 16;
 
 impl From<VertexFormat> for MTLVertexFormat {
@@ -282,6 +289,10 @@ pub struct MetalContext {
     /// for `apply_scissor_rect`'s Y-flip + clamp.
     current_pass_width: u32,
     current_pass_height: u32,
+    // Bookkeeping for the deferred-end pass-merge in `begin_pass`
+    // / `end_render_pass`.
+    current_pass_target: Option<Option<RenderPass>>,
+    pending_end_encoder: bool,
     view: ObjcId,
     device: ObjcId,
     current_frame_index: usize,
@@ -357,7 +368,7 @@ impl MetalContext {
                 MTLResourceOptions::CPUCacheModeWriteCombined
                     | MTLResourceOptions::StorageModeManaged
             };
-            #[cfg(target_os = "ios")]
+            #[cfg(any(target_os = "ios", target_os = "tvos"))]
             let options = { MTLResourceOptions::CPUCacheModeWriteCombined };
 
             let uniform_buffers = [
@@ -375,6 +386,8 @@ impl MetalContext {
                 render_encoder: None,
                 current_pass_width: 0,
                 current_pass_height: 0,
+                current_pass_target: None,
+                pending_end_encoder: false,
                 view,
                 device,
                 buffers: vec![],
@@ -389,6 +402,17 @@ impl MetalContext {
                 current_ub_offset: 0,
             }
         }
+    }
+
+    /// Actually call `endEncoding` and clear deferred-end state.
+    /// `end_render_pass` defers this so consecutive same-target
+    /// begin/end pairs can collapse into one Metal pass.
+    fn really_end_encoder(&mut self) {
+        if let Some(render_encoder) = self.render_encoder.take() {
+            unsafe { msg_send_!(render_encoder, endEncoding) };
+        }
+        self.current_pass_target = None;
+        self.pending_end_encoder = false;
     }
 }
 
@@ -534,6 +558,10 @@ impl RenderingBackend for MetalContext {
             texture.params.allocate_mipmaps,
             "texture_generate_mipmaps called on a texture allocated without mipmaps",
         );
+        // Close any deferred render encoder before opening a blit
+        // encoder on the same command buffer — Metal asserts
+        // "encoding in progress" otherwise.
+        self.really_end_encoder();
         unsafe {
             if self.command_buffer.is_none() {
                 self.command_buffer = Some(msg_send![self.command_queue, commandBuffer]);
@@ -574,8 +602,12 @@ impl RenderingBackend for MetalContext {
         resolve_img: Option<&[TextureId]>,
         depth_img: Option<TextureId>,
     ) -> RenderPass {
-        if resolve_img.is_some() {
-            unimplemented!("resolve textures are not yet implemented on metal");
+        if let Some(resolve_img) = resolve_img {
+            assert_eq!(
+                resolve_img.len(),
+                color_img.len(),
+                "resolve_img must have one entry per color attachment"
+            );
         }
         unsafe {
             let render_pass_desc =
@@ -587,7 +619,19 @@ impl RenderingBackend for MetalContext {
                 let color_attachment = msg_send_![msg_send_![render_pass_desc, colorAttachments], objectAtIndexedSubscript:i];
                 msg_send_![color_attachment, setTexture: color_texture];
                 msg_send_![color_attachment, setLoadAction: MTLLoadAction::Clear];
-                msg_send_![color_attachment, setStoreAction: MTLStoreAction::Store];
+                // Multisample resolve: when the caller passes a resolve
+                // texture for this attachment, downsample into it on
+                // store. Required for any MSAA render target.
+                if let Some(resolve_img) = resolve_img {
+                    let resolve_texture = self.textures.get(resolve_img[i]).texture;
+                    msg_send_![color_attachment, setResolveTexture: resolve_texture];
+                    msg_send_![
+                        color_attachment,
+                        setStoreAction: MTLStoreAction::MultisampleResolve
+                    ];
+                } else {
+                    msg_send_![color_attachment, setStoreAction: MTLStoreAction::Store];
+                }
             }
             if let Some(depth_img) = depth_img {
                 let depth_texture = self.textures.get(depth_img).texture;
@@ -639,7 +683,7 @@ impl RenderingBackend for MetalContext {
                 MTLResourceOptions::CPUCacheModeWriteCombined
                     | MTLResourceOptions::StorageModeManaged
             }
-            #[cfg(target_os = "ios")]
+            #[cfg(any(target_os = "ios", target_os = "tvos"))]
             {
                 MTLResourceOptions::CPUCacheModeWriteCombined
             }
@@ -774,12 +818,28 @@ impl RenderingBackend for MetalContext {
                     msg_send_![descriptor, setPixelFormat: view_pixel_format];
                 }
                 msg_send_![descriptor, setStorageMode: MTLStorageMode::Private];
-                msg_send_![
-                    descriptor,
-                    setUsage: MTLTextureUsage::RenderTarget as u64
-                        | MTLTextureUsage::ShaderRead as u64
-                        | MTLTextureUsage::ShaderWrite as u64
-                ];
+                if params.sample_count > 1 {
+                    // MSAA target — render-only, no mipmaps, no
+                    // shader-sample (the resolve texture is sampled
+                    // instead).
+                    msg_send_![
+                        descriptor,
+                        setTextureType: MTLTextureType::D2Multisample
+                    ];
+                    msg_send_![descriptor, setSampleCount: params.sample_count as u64];
+                    msg_send_![descriptor, setMipmapLevelCount: 1u64];
+                    msg_send_![
+                        descriptor,
+                        setUsage: MTLTextureUsage::RenderTarget as u64
+                    ];
+                } else {
+                    msg_send_![
+                        descriptor,
+                        setUsage: MTLTextureUsage::RenderTarget as u64
+                            | MTLTextureUsage::ShaderRead as u64
+                            | MTLTextureUsage::ShaderWrite as u64
+                    ];
+                }
             } else {
                 #[cfg(target_os = "macos")]
                 {
@@ -790,7 +850,7 @@ impl RenderingBackend for MetalContext {
                         setResourceOptions: MTLResourceOptions::StorageModeManaged
                     ];
                 }
-                #[cfg(target_os = "ios")]
+                #[cfg(any(target_os = "ios", target_os = "tvos"))]
                 {
                     msg_send_![descriptor, setStorageMode: MTLStorageMode::Shared];
                     msg_send_![
@@ -1056,6 +1116,11 @@ impl RenderingBackend for MetalContext {
                     setStencilAttachmentPixelFormat: view_depth_stencil_format
                 ];
             }
+            // Pipeline sampleCount must match every render-pass
+            // color attachment it binds to; use the view's as the
+            // canonical app-wide value.
+            let view_sample_count: u64 = msg_send![self.view, sampleCount];
+            msg_send_![descriptor, setSampleCount: view_sample_count];
 
             let mut error: ObjcId = nil;
             let pipeline_state: ObjcId = msg_send![
@@ -1225,6 +1290,22 @@ impl RenderingBackend for MetalContext {
 
     fn begin_pass(&mut self, pass: Option<RenderPass>, action: PassAction) {
         unsafe {
+            // Reuse the deferred encoder if this begin continues the
+            // same target with a load-style action — collapses the
+            // per-draw-call begin/end pattern (e.g. macroquad's) into
+            // one Metal pass, avoiding a store + (for MSAA) resolve
+            // per draw on tile-based GPUs.
+            if self.pending_end_encoder
+                && self.current_pass_target == Some(pass)
+                && matches!(action, PassAction::Nothing)
+            {
+                self.pending_end_encoder = false;
+                return;
+            }
+            if self.pending_end_encoder {
+                self.really_end_encoder();
+            }
+
             if self.command_buffer.is_none() {
                 self.command_buffer = Some(msg_send![self.command_queue, commandBuffer]);
             }
@@ -1272,7 +1353,19 @@ impl RenderingBackend for MetalContext {
             let color_attachments = msg_send_![descriptor, colorAttachments];
             let color_attachment = msg_send_![color_attachments, objectAtIndexedSubscript: 0];
 
-            msg_send_![color_attachment, setStoreAction: MTLStoreAction::Store];
+            // If the attachment has a resolve texture, use
+            // `StoreAndMultisampleResolve` (not just
+            // `MultisampleResolve`) so the multisample texture
+            // survives target-switch boundaries within a frame —
+            // a later `Load` on the same target would otherwise
+            // read discarded memory.
+            let resolve_texture: ObjcId = msg_send![color_attachment, resolveTexture];
+            let store_action = if resolve_texture.is_null() {
+                MTLStoreAction::Store
+            } else {
+                MTLStoreAction::StoreAndMultisampleResolve
+            };
+            msg_send_![color_attachment, setStoreAction: store_action];
 
             match action {
                 PassAction::Clear { color, .. } => {
@@ -1308,6 +1401,8 @@ impl RenderingBackend for MetalContext {
             // });
 
             self.render_encoder = Some(render_encoder);
+            self.current_pass_target = Some(pass);
+            self.pending_end_encoder = false;
         }
     }
 
@@ -1317,10 +1412,10 @@ impl RenderingBackend for MetalContext {
             "end_render_pass unpaired with begin_render_pass!"
         );
 
-        let render_encoder = self.render_encoder.unwrap();
-        unsafe { msg_send_!(render_encoder, endEncoding) };
-
-        self.render_encoder = None;
+        // Defer `endEncoding`; see `begin_pass` for the reuse rule.
+        // Anything that breaks the merge invariant runs
+        // `really_end_encoder` first.
+        self.pending_end_encoder = true;
         self.index_buffer = None;
     }
 
@@ -1352,6 +1447,11 @@ impl RenderingBackend for MetalContext {
     }
 
     fn commit_frame(&mut self) {
+        // Flush the deferred `endEncoding` from the last
+        // `end_render_pass`.
+        if self.pending_end_encoder {
+            self.really_end_encoder();
+        }
         unsafe {
             assert!(!self.command_queue.is_null());
             let drawable: ObjcId = msg_send!(self.view, currentDrawable);
