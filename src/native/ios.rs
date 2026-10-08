@@ -179,7 +179,8 @@ fn dispatch_message(payload: &mut IosDisplay, msg: Message) {
         }
         Message::ImePreedit(text) => {
             if let Some(ref mut event_handler) = payload.event_handler {
-                event_handler.on_ime_preedit(&text);
+                let cursor_pos = text.encode_utf16().count();
+                event_handler.on_ime_preedit(&text, cursor_pos);
             }
         }
         Message::ImeCommit(text) => {
@@ -1050,6 +1051,42 @@ pub fn define_app_delegate() -> *const Class {
         decl.add_method(
             sel!(applicationWillResignActive:),
             application_will_resign_active as extern "C" fn(&Object, Sel, ObjcId),
+        );
+    }
+    decl.register()
+}
+
+fn define_hidden_textview() -> *const Class {
+    let superclass = class!(UITextView);
+    let mut decl = ClassDecl::new("QuadHiddenTextView", superclass).unwrap();
+
+    // Allow touches to pass through directly to the underlying QuadView
+    extern "C" fn hit_test(_: &Object, _: Sel, _: NSPoint, _: ObjcId) -> ObjcId {
+        nil
+    }
+
+    // Support standard context menu actions
+    extern "C" fn can_perform_action(_: &Object, _: Sel, action: Sel, _: ObjcId) -> BOOL {
+        if action == sel!(copy:)
+            || action == sel!(paste:)
+            || action == sel!(cut:)
+            || action == sel!(selectAll:)
+            || action == sel!(select:)
+        {
+            YES
+        } else {
+            NO
+        }
+    }
+
+    unsafe {
+        decl.add_method(
+            sel!(hitTest:withEvent:),
+            hit_test as extern "C" fn(&Object, Sel, NSPoint, ObjcId) -> ObjcId,
+        );
+        decl.add_method(
+            sel!(canPerformAction:withSender:),
+            can_perform_action as extern "C" fn(&Object, Sel, Sel, ObjcId) -> BOOL,
         );
     }
     decl.register()
